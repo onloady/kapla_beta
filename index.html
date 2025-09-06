@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Kapla Regular N-gon + Save/Load</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+    canvas { touch-action: none; }
+    .ui {
+      position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      background: rgba(255,255,255,0.9); border: 1px solid #e5e7eb; border-radius: 12px;
+      padding: 8px 10px; z-index: 10; box-shadow: 0 4px 18px rgba(0,0,0,0.08); backdrop-filter: blur(6px);
+      max-width: calc(100vw - 20px);
+    }
+    .ui input, .ui select {
+      padding: 8px 10px; border-radius: 10px; border: 1px solid #d1d5db; font-size: 14px; background: #fff;
+    }
+    .ui button {
+      padding: 8px 12px; border-radius: 10px; border: 1px solid #d1d5db; background: #f3f4f6; font-size: 14px;
+    }
+    .ui button.primary { background: #0ea5e9; color: #fff; border-color: transparent; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .muted { font-size: 12px; color: #6b7280; }
+    @media (prefers-color-scheme: dark){
+      .ui { background: rgba(20,20,22,0.75); border-color: #303236; color: #e5e7eb; }
+      .ui input, .ui select { background: #111317; border-color: #303236; color: #e5e7eb; }
+      .ui button { background: #1f2329; border-color: #303236; color: #e5e7eb; }
+      .ui button.primary { background: #38bdf8; color: #0b0c0f; }
+    }
+  </style>
+</head>
+<body>
+  <div class="ui" role="group" aria-label="정n각형 & 저장">
+    <div class="row">
+      <label for="nInput">n</label>
+      <input id="nInput" type="number" min="3" max="180" step="1" value="6" inputmode="numeric" />
+      <label for="rInput">반지름</label>
+      <input id="rInput" type="number" min="0.5" max="200" step="0.5" value="4" inputmode="decimal" />
+      <button id="btnGen" class="primary">정n각형 생성</button>
+      <button id="btnClear">지우기</button>
+    </div>
+    <div class="row">
+      <input id="sceneName" type="text" placeholder="이름(예: n=6 R=4)" style="width:180px" />
+      <button id="btnSave" class="primary">저장</button>
+      <select id="sceneList"></select>
+      <button id="btnLoad">불러오기</button>
+      <button id="btnDelete">삭제</button>
+    </div>
+    <div class="row muted" id="status">서버 주소 설정 후 사용하세요.</div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/TransformControls.js"></script>
+  <script>
+    // 서버 주소만 환경에 맞게 수정하세요.
+    // 로컬: 'http://localhost:3000'
+    // Render/서버 배포 시: 'https://<your-domain>'
+    const SERVER_URL = 'http://localhost:3000';
+
+    // 기본 장면
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xeeeeee);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 2000);
+    camera.position.set(6, 6, 12);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // 컨트롤(모바일 핀치 줌)
+    const orbit = new THREE.OrbitControls(camera, renderer.domElement);
+    orbit.enableZoom = true;
+    orbit.zoomSpeed = 1.0;
+    orbit.minDistance = 1;
+    orbit.maxDistance = 500;
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.08;
+    orbit.screenSpacePanning = true;
+    orbit.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+    renderer.domElement.style.touchAction = 'none';
+
+    // 바닥/조명
+    scene.add(new THREE.GridHelper(100, 100, 0x999999, 0xdddddd));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 7);
+    scene.add(dirLight, new THREE.AmbientLight(0xffffff, 0.5));
+
+    // 기본 카플라 지오메트리/재질
+    const baseGeom = new THREE.BoxGeometry(1, 0.2, 0.3);
+    const baseColor = 0xffcc66;
+
+    // 그룹
+    let polygonGroup = new THREE.Group();
+    scene.add(polygonGroup);
+
+    // TransformControls
+    const transformControls = new THREE.TransformControls(camera, renderer.domElement);
+    transformControls.setMode("rotate");
+    transformControls.setSize(3);
+    scene.add(transformControls);
+    transformControls.addEventListener('dragging-changed', (e) => { orbit.enabled = !e.value; });
+
+    // 선택
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let selected = null;
+
+    const activePointers = new Set();
+    renderer.domElement.addEventListener('pointerdown', e => activePointers.add(e.pointerId));
+    ['pointerup','pointercancel','lostpointercapture'].forEach(type=>{
+      renderer.domElement.addEventListener(type, e => activePointers.delete(e.pointerId));
+    });
+
+    window.addEventListener('pointerdown', (e) => {
+      if (transformControls.dragging) return;
+      if (activePointers.size >= 2) return; // 핀치 중 선택 방지
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(polygonGroup.children, false);
+      if (intersects.length > 0) {
+        selected = intersects[0].object;
+        transformControls.attach(selected);
+        orbit.target.copy(selected.position);
+      } else {
+        transformControls.detach();
+        selected = null;
+      }
+    });
+
+    // 정n각형 생성
+    function clearPolygon() {
+      transformControls.detach();
+      selected = null;
+      // 기존 메쉬 제거
+      polygonGroup.children.forEach(ch => {
+        // geometry/material은 base를 공유하지 않도록 각자 생성할 예정이어서 제거
+        ch.geometry?.dispose?.();
+        ch.material?.dispose?.();
+      });
+      scene.remove(polygonGroup);
+      polygonGroup = new THREE.Group();
+      scene.add(polygonGroup);
+    }
+
+    function createRegularNGonBlocks(n, R) {
+      if (n < 3) { alert('n은 3 이상이어야 합니다.'); return; }
+      clearPolygon();
+      const sideLen = 2 * R * Math.sin(Math.PI / n);
+      const midRadius = R * Math.cos(Math.PI / n);
+      const twoPi = Math.PI * 2;
+
+      for (let i = 0; i < n; i++) {
+        const theta = i * twoPi / n + Math.PI / n; // 변의 법선 방향 각도
+        const cx = midRadius * Math.cos(theta);
+        const cz = midRadius * Math.sin(theta);
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 0.2, 0.3), new THREE.MeshStandardMaterial({ color: baseColor }));
+        mesh.position.set(cx, 0.1, cz);
+        mesh.scale.set(sideLen, 1, 1); // X축으로 변 길이만큼 스케일링
+        mesh.rotation.y = theta + Math.PI / 2; // 변 방향과 일치
+        polygonGroup.add(mesh);
+      }
+    }
+
+    // UI 참조
+    const nInput = document.getElementById('nInput');
+    const rInput = document.getElementById('rInput');
+    const btnGen = document.getElementById('btnGen');
+    const btnClear = document.getElementById('btnClear');
+    const btnSave = document.getElementById('btnSave');
+    const btnLoad = document.getElementById('btnLoad');
+    const btnDelete = document.getElementById('btnDelete');
+    const sceneName = document.getElementById('sceneName');
+    const sceneList = document.getElementById('sceneList');
+    const statusEl = document.getElementById('status');
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      setTimeout(() => { if (statusEl.textContent === msg) statusEl.textContent = ''; }, 2000);
+    }
+
+    btnGen.addEventListener('click', () => {
+      const n = Math.max(3, Math.floor(Number(nInput.value || 0)));
+      const R = Math.max(0.5, Number(rInput.value || 4));
+      createRegularNGonBlocks(n, R);
+      orbit.target.set(0,0,0);
+      setStatus(`정${n}각형 생성`);
+    });
+
+    btnClear.addEventListener('click', () => {
+      clearPolygon();
+      setStatus('지웠습니다');
+    });
+
+    // 직렬화/역직렬화
+    function serializeScene() {
+      const blocks = polygonGroup.children.map(mesh => {
+        const p = mesh.position, r = mesh.rotation, s = mesh.scale;
+        const mat = mesh.material;
+        const color = (mat && mat.color) ? `#${mat.color.getHexString()}` : '#ffcc66';
+        return {
+          position: [p.x, p.y, p.z],
+          rotation: [r.x, r.y, r.z],
+          scale: [s.x, s.y, s.z],
+          color
+        };
+      });
+      const meta = {
+        n: Math.max(3, Math.floor(Number(nInput.value || 0))) || null,
+        R: Math.max(0.5, Number(rInput.value || 0)) || null
+      };
+      return { blocks, meta };
+    }
+
+    function restoreScene(doc) {
+      clearPolygon();
+      const blocks = Array.isArray(doc.blocks) ? doc.blocks : [];
+      for (const b of blocks) {
+        const geom = new THREE.BoxGeometry(1, 0.2, 0.3);
+        const mat = new THREE.MeshStandardMaterial({ color: (b.color || '#ffcc66') });
+        const mesh = new THREE.Mesh(geom, mat);
+        const [px, py, pz] = b.position || [0,0,0];
+        const [rx, ry, rz] = b.rotation || [0,0,0];
+        const [sx, sy, sz] = b.scale || [1,1,1];
+        mesh.position.set(px, py, pz);
+        mesh.rotation.set(rx, ry, rz);
+        mesh.scale.set(sx, sy, sz);
+        polygonGroup.add(mesh);
+      }
+      if (doc.meta) {
+        if (typeof doc.meta.n === 'number') nInput.value = doc.meta.n;
+        if (typeof doc.meta.R === 'number') rInput.value = doc.meta.R;
+      }
+    }
+
+    // 서버 통신
+    async function fetchJSON(url, opts) {
+      try {
+        const res = await fetch(url, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts && opts.headers) } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      } catch (e) {
+        console.error(e);
+        throw e;
+      }
+    }
+
+    async function refreshList() {
+      try {
+        const data = await fetchJSON(`${SERVER_URL}/api/scenes`);
+        sceneList.innerHTML = '';
+        data.items.forEach(it => {
+          const opt = document.createElement('option');
+          const d = new Date(it.updatedAt);
+          opt.value = it.id;
+          opt.textContent = `${it.name} · ${d.getFullYear()}.${String(d.getMonth()+1).padStart(2,'0')}.${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+          sceneList.appendChild(opt);
+        });
+        setStatus('목록 갱신 완료');
+      
